@@ -1,69 +1,83 @@
-# -*- coding: utf-8 -*-
-"""
-邮件发送，包括失败通知。
-
-失败通知是这次架构讨论里明确提到、但旧代码完全没有的一层：原来任何
-异常都是 print() 到 GitHub Actions 日志里，没人主动看就没人知道出过
-问题——这次对话里好几个 bug 都是这样在数据里存在了不知道多久，直到
-你自己手动发现异常才被追出来。这里加一个 notify_failure，任何主流程
-里的未捕获异常都应该走这个函数，而不是只打印然后让整个 job 静默标红
-（GitHub Actions 的红叉本身也不会主动推给你，除非你专门配置了通知）。
-"""
 import os
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
+def get_smtp_config(email_account: str):
+    """根据邮箱后缀自动匹配最佳的 SMTP 服务器和端口"""
+    email_account = email_account.lower().strip()
+    if email_account.endswith("@gmail.com"):
+        return "smtp.gmail.com", 587, "tls"
+    elif email_account.endswith("@qq.com"):
+        return "smtp.qq.com", 465, "ssl"
+    elif email_account.endswith("@163.com"):
+        return "smtp.163.com", 465, "ssl"
+    else:
+        domain = email_account.split("@")[-1]
+        return f"smtp.{domain}", 587, "tls"
 
-def _get_email_targets() -> list:
-    raw = os.environ.get("TARGET_EMAILS", "")
-    return [e.strip() for e in raw.split(",") if e.strip()]
+def send_email(subject: str, content: str):
+    """
+    发送邮件通知
+    :param subject: 邮件主题
+    :param content: 邮件正文 (支持 HTML / Plain)
+    """
+    account = os.environ.get("EMAIL_ACCOUNT", "").strip()
+    password = os.environ.get("EMAIL_PASSWORD", "").strip()
+    target_emails_str = os.environ.get("TARGET_EMAILS", "").strip()
 
+    if not account or not password or not target_emails_str:
+        print("❌ 邮件发送失败: EMAIL_ACCOUNT, EMAIL_PASSWORD 或 TARGET_EMAILS 环境变量未完整配置")
+        return False
 
-def send_email(subject: str, html_body: str) -> None:
-    account = os.environ.get("EMAIL_ACCOUNT")
-    password = os.environ.get("EMAIL_PASSWORD")
-    targets = _get_email_targets()
+    # 支持逗号/分号分隔多个接收邮箱
+    target_emails = [
+        e.strip() for e in target_emails_str.replace(";", ",").split(",") if e.strip()
+    ]
 
-    if not account or not password or not targets:
-        print("⚠️ 邮件相关环境变量(EMAIL_ACCOUNT/EMAIL_PASSWORD/TARGET_EMAILS)未配置完整，跳过发送，仅打印内容。")
-        print(f"[邮件主题] {subject}")
-        return
+    if not target_emails:
+        print("❌ 邮件发送失败: 接收邮箱列表为空")
+        return False
 
     msg = MIMEMultipart()
-    msg["Subject"] = subject
     msg["From"] = account
-    msg["To"] = ", ".join(targets)
-    msg.attach(MIMEText(html_body, "html", "utf-8"))
+    msg["To"] = ", ".join(target_emails)
+    msg["Subject"] = subject
 
+    # 判断并设置 HTML 格式
+    if any(tag in content.lower() for tag in ["<html", "<div", "<p", "<table"]):
+        msg.attach(MIMEText(content, "html", "utf-8"))
+    else:
+        msg.attach(MIMEText(content, "plain", "utf-8"))
+
+    smtp_host, smtp_port, mode = get_smtp_config(account)
+
+    # 执行发送（优先尝试默认端口，失败自动做容错处理）
     try:
-        with smtplib.SMTP_SSL("smtp.qq.com", 465, timeout=20) as server:
+        if mode == "ssl":
+            server = smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=20)
             server.login(account, password)
-            server.sendmail(account, targets, msg.as_string())
-        print(f"✅ 邮件已发送至 {len(targets)} 个地址")
+            server.sendmail(account, target_emails, msg.as_string())
+            server.quit()
+        else:  # Gmail 标准 TLS 模式
+            try:
+                server = smtplib.SMTP(smtp_host, smtp_port, timeout=20)
+                server.ehlo()
+                server.starttls()
+                server.ehlo()
+                server.login(account, password)
+                server.sendmail(account, target_emails, msg.as_string())
+                server.quit()
+            except Exception as tls_err:
+                print(f"⚠️ TLS 587 端口连接异常 ({tls_err})，正在尝试 465 SSL 备用模式...")
+                server = smtplib.SMTP_SSL(smtp_host, 465, timeout=20)
+                server.login(account, password)
+                server.sendmail(account, target_emails, msg.as_string())
+                server.quit()
+
+        print(f"✅ 邮件已成功发送至: {', '.join(target_emails)}")
+        return True
+
     except Exception as e:
         print(f"❌ 邮件发送失败: {e}")
-        raise
-
-
-def notify_failure(context: str, error: Exception) -> None:
-    """
-    主流程崩溃时调用——发一封明确标注"失败"的邮件，而不是让异常只
-    停留在 GitHub Actions 日志里等你自己发现。哪怕邮件本身也发送
-    失败，这里也不会再抛出新的异常掩盖原始错误（用 try/except 包住
-    发送本身，但原始异常在调用方那边应该继续往上抛，不在这里吞掉）。
-    """
-    subject = f"⚠️ 扫描任务失败: {context}"
-    body = f"""
-    <div style="font-family:sans-serif;padding:20px;">
-        <h2 style="color:#c62828;">扫描任务执行失败</h2>
-        <p><b>阶段:</b> {context}</p>
-        <p><b>错误类型:</b> {type(error).__name__}</p>
-        <p><b>错误信息:</b> {str(error)}</p>
-        <p style="color:#888;font-size:13px;">请检查 GitHub Actions 运行日志获取完整堆栈信息。</p>
-    </div>
-    """
-    try:
-        send_email(subject, body)
-    except Exception as notify_error:
-        print(f"❌ 连失败通知邮件本身也发送失败了: {notify_error}（原始错误请看上面的日志）")
+        return False
